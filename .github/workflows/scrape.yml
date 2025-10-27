@@ -31,3 +31,4 @@ jobs:
           path: |
             models_colors.csv
             color_counts.csv
+            debug/
