@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 BASE_DESIGNER = "https://thangs.com/designer/The%20Kit%20Kiln"
 
 MODEL_LINK_RE = re.compile(r"/designer/[^/]+/3d-model/[^?\s]+-\d+$", re.IGNORECASE)
-POLY_LINE_RE  = re.compile(r"Polymaker\s+Matte\s+.*?PLA", re.IGNORECASE)
+POLY_LINE_RE  = re.compile(r"Polymaker\s+.*?PLA", re.IGNORECASE)
 
 DEBUG_DIR = Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
 
