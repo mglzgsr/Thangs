@@ -10,8 +10,52 @@ BASE_DESIGNER = "https://thangs.com/designer/The%20Kit%20Kiln"
 
 MODEL_LINK_RE = re.compile(r"/designer/[^/]+/3d-model/[^?\s]+-\d+$", re.IGNORECASE)
 POLY_LINE_RE  = re.compile(r"Polymaker\s+.*?PLA", re.IGNORECASE)
-
+HEADER_RE = re.compile(
+    r"(Want your.*?Shop the filament we used on the Polymaker Website|Shop the filament we used on the Polymaker Website)",
+    re.IGNORECASE | re.DOTALL
+)
 DEBUG_DIR = Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
+
+def _extract_from_poly_block(soup):
+    """
+    Intenta localizar el bloque de 'Shop the filament...' y extrae SOLO ahí.
+    Busca el texto del encabezado, sube a un contenedor y recorre
+    hermanos inmediatos (p, li, a, div cortos) hasta topar con otra sección.
+    """
+    # 1) localizar nodo de texto con el header
+    header_node = soup.find(string=HEADER_RE)
+    if not header_node:
+        return []
+
+    # 2) sube a un contenedor razonable
+    container = header_node.find_parent(["section", "div", "article", "main"]) or header_node.parent
+
+    # 3) crea una lista lineal de nodos 'después del header' pero cerca
+    # heurística: siguientes 10-15 nodos de texto/enlaces/list items
+    colors = []
+    def consider_text(txt):
+        for m in POLY_ITEM_RE.findall(txt or ""):
+            c = m.strip()
+            if c and c.lower() not in [x.lower() for x in colors]:
+                colors.append(c)
+
+    # recoger enlaces y textos cercanos
+    # a) enlaces dentro del mismo contenedor cercano al header
+    for tag in container.find_all(["a", "li", "p", "div"], limit=50):
+        # corta si aparece otra cabecera o un separator fuerte
+        if tag.name in ("h1", "h2", "h3", "hr"):
+            break
+        t = tag.get_text(" ", strip=True)
+        # prioridad: anchors que apunten a Polymaker
+        if tag.name == "a":
+            href = (tag.get("href") or "").lower()
+            if "polymaker" in href:
+                consider_text(tag.get_text(" ", strip=True))
+                continue
+        # si no hay anchor a Polymaker, igualmente considera el texto del tag
+        consider_text(t)
+
+    return colors
 
 def dump_debug(page, name):
     try:
@@ -109,23 +153,38 @@ def extract_polymaker_colors(page, model_url):
         page.goto(model_url, wait_until="domcontentloaded", timeout=60000)
     except PwTimeout:
         page.goto(model_url, wait_until="networkidle", timeout=60000)
-    time.sleep(1.2)  # dar tiempo a contenido tardío
+
+    time.sleep(1.2)
     html = page.content()
     soup = BeautifulSoup(html, "lxml")
 
-    title_node = soup.find(["h1","title"])
-    title_text = title_node.get_text(strip=True) if title_node else model_url.rsplit("/",1)[-1]
+    # Título
+    title_node = soup.find(["h1", "title"])
+    title_text = title_node.get_text(strip=True) if title_node else model_url.rsplit("/", 1)[-1]
 
-    text = soup.get_text("\n", strip=True)
-    raw = POLY_LINE_RE.findall(text)
+    # 1) Primero: intentar en el bloque acotado
+    colors = _extract_from_poly_block(soup)
 
-    colors=[]
-    for m in raw:
-        t=re.sub(r"(?i)^Polymaker\s+","",m)
-        t=re.sub(r"(?i)\s*PLA\s*$","",t).strip()
-        if t.lower() not in [c.lower() for c in colors]:
-            colors.append(t)
-    return title_text, colors
+    # 2) Fallback: si no encontramos el bloque, usar el método global
+    if not colors:
+        text = soup.get_text("\n", strip=True)
+        raw_matches = POLY_LINE_RE.findall(text)  # tu regex anterior (Polymaker Matte ... PLA)
+        for m in raw_matches:
+            c = m.strip()
+            if c and c.lower() not in [x.lower() for x in colors]:
+                colors.append(c)
+
+    # Limpieza final (igual que ya haces en tu pipeline)
+    clean_colors = []
+    for c in colors:
+        t = re.sub(r"(?i)^Matte\s+", "Matte ", c)   # normaliza prefijo
+        t = re.sub(r"(?i)\s*PLA\s*$", "", t)        # quita 'PLA' sobrante si aparece
+        t = t.strip(" -–—·.")
+        if t and t.lower() != "matte" and len(t.split()) >= 2:
+            if t.lower() not in [x.lower() for x in clean_colors]:
+                clean_colors.append(t)
+
+    return title_text, clean_colors
 
 def main():
     designer = sys.argv[1] if len(sys.argv) > 1 else BASE_DESIGNER
