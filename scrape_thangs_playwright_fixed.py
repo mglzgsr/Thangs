@@ -8,7 +8,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
 BASE_DESIGNER = "https://thangs.com/designer/The%20Kit%20Kiln"
 
-MODEL_LINK_RE = re.compile(r"/designer/The%20Kit%20Kiln/3d-model/[^?\s]+-\d+$")
+MODEL_LINK_RE = re.compile(r"/designer/[^/]+/3d-model/[^?\s]+-\d+$", re.IGNORECASE)
 POLY_LINE_RE  = re.compile(r"Polymaker\s+Matte\s+.*?PLA", re.IGNORECASE)
 
 DEBUG_DIR = Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
@@ -26,41 +26,54 @@ def dump_debug(page, name):
 def collect_links_from_html(html):
     soup = BeautifulSoup(html, "lxml")
     urls = set()
+
+    # 1) Preferido: enlaces de modelo con patrón completo /designer/<name>/3d-model/<slug>-<id>
     for a in soup.find_all("a", href=True):
         href = a["href"] or ""
         if MODEL_LINK_RE.search(href):
             urls.add(urljoin("https://thangs.com", href))
+
+    # 2) Fallback: cualquier /3d-model/ (por si el HTML cambia o vienen de colecciones)
+    if not urls:
+        for a in soup.find_all("a", href=True):
+            href = a["href"] or ""
+            if "/3d-model/" in href:
+                urls.add(urljoin("https://thangs.com", href))
+
     return urls
 
-def discover_model_urls_scroll(page, designer_url):
+def discover_model_urls_scroll(page, listing_url):
     urls = set()
     print("[*] Intentando scroll infinito…")
-    page.goto(designer_url, wait_until="networkidle", timeout=90000)
+    page.goto(listing_url, wait_until="networkidle", timeout=90000)
     time.sleep(1.0)
-    # si no aparecen links, relajar condición
+    # Relajamos el selector: cualquier enlace a /3d-model/
     try:
-        page.wait_for_selector('a[href*="/designer/The%20Kit%20Kiln/3d-model/"]', timeout=15000)
+        page.wait_for_selector('a[href*="/3d-model/"]', timeout=15000)
     except PwTimeout:
         print("[!] No aparecieron enlaces tras networkidle; probamos domcontentloaded + debug dump")
         dump_debug(page, "designer_initial")
-        page.goto(designer_url, wait_until="domcontentloaded", timeout=90000)
+        page.goto(listing_url, wait_until="domcontentloaded", timeout=90000)
         time.sleep(2.0)
 
     last_height = 0
     stagnant = 0
     for _ in range(30):
-        # recoger enlaces visibles
-        urls |= collect_links_from_html(page.content())
+        html = page.content()
+        urls |= collect_links_from_html(html)  # usa collect_links_from_html actualizado abajo
+
         # scroll
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             pass
         time.sleep(1.0)
+
         try:
             height = page.evaluate("document.body.scrollHeight")
         except Exception:
             height = last_height
+
         if height == last_height:
             stagnant += 1
         else:
@@ -68,14 +81,15 @@ def discover_model_urls_scroll(page, designer_url):
         last_height = height
         if stagnant >= 3:
             break
+
     print(f"[*] Scroll recogió {len(urls)} enlaces")
     return sorted(urls)
 
-def discover_model_urls_paged(page, designer_url, max_pages=20):
+def discover_model_urls_paged(page, listing_url, max_pages=20):
     print("[*] Intentando paginación ?page=N…")
     urls = set()
     for n in range(1, max_pages+1):
-        url = designer_url if n == 1 else f"{designer_url}?page={n}"
+        url = listing_url if n == 1 else f"{listing_url}?page={n}"
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
         except PwTimeout:
@@ -85,8 +99,7 @@ def discover_model_urls_paged(page, designer_url, max_pages=20):
         found = collect_links_from_html(html)
         print(f"    - page {n}: {len(found)} enlaces")
         urls |= found
-        if not found:
-            # si una página ya no trae nada, paramos
+        if not found:  # si ya no hay más, paramos
             break
     print(f"[*] Paginación recogió {len(urls)} enlaces")
     return sorted(urls)
