@@ -28,18 +28,23 @@ DEBUG_DIR = Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
 # Enlaces de modelos (cualquier diseñador/colección)
 MODEL_LINK_RE = re.compile(r"/designer/[^/]+/3d-model/[^?\s]+-\d+$", re.IGNORECASE)
 
-# Encabezado de bloque Polymaker (varias variantes toleradas)
+# Encabezado de bloque Polymaker
 HEADER_RE = re.compile(
-    r"(Want your print.*?Shop the filament we used on the Polymaker Website|Shop the filament we used on the Polymaker Website)",
+    r"(Want your.*?Shop the filament we used on the Polymaker Website|Shop the filament we used on the Polymaker Website)",
     re.IGNORECASE | re.DOTALL
 )
 
-# Línea de color dentro del bloque
-# Captura "Polymaker Matte <COLOR> PLA"
-POLY_ITEM_RE  = re.compile(r"Polymaker\s+Matte\s+(.+?)\s+PLA", re.IGNORECASE)
+# Coincide con cualquier acabado (Matte, Silk, Glossy, Galaxy...) hasta PLA
+POLY_ITEM_RE = re.compile(
+    r"Polymaker\s+([A-Za-z]+(?:\s+[A-Za-z]+)*?)\s+PLA\b", re.IGNORECASE
+)
 
-# Fallback global (por si no hay bloque)
-POLY_LINE_RE  = re.compile(r"Polymaker\s+Matte\s+(.+?)\s+PLA", re.IGNORECASE)
+# También para fallback global
+POLY_LINE_RE = POLY_ITEM_RE
+
+POLY_DOMAIN_RE = re.compile(
+    r"https?://([a-z0-9\-]+\.)*polymaker\.com\b", re.IGNORECASE
+)
 
 # ---------- Utilidades ----------
 def dump_debug(page, name: str):
@@ -161,38 +166,50 @@ def discover_model_urls_paged(page, listing_url: str, max_pages: int = 20):
     print(f"[*] Paginación recogió {len(urls)} enlaces")
     return sorted(urls)
 
-def _extract_from_poly_block(soup: BeautifulSoup):
-    """
-    Localiza el bloque 'Shop the filament we used on the Polymaker Website'
-    y extrae SOLO ahí los colores Polymaker Matte <COLOR> PLA.
-    """
+def _extract_from_poly_block_strict(soup: BeautifulSoup):
+    """Solo anchors que apunten a polymaker.com dentro del bloque Polymaker."""
     header_node = soup.find(string=HEADER_RE)
     if not header_node:
         return []
 
     container = header_node.find_parent(["section", "div", "article", "main"]) or header_node.parent
+    colors, seen = [], set()
 
-    colors = []
-
-    def consider_text(txt: str):
-        for m in POLY_ITEM_RE.findall(txt or ""):
-            c = m.strip()
-            if c and c.lower() not in [x.lower() for x in colors]:
-                colors.append(c)
-
-    # Recoge tags cercanos (enlaces/listas/párrafos). Corta en cabecera/separador fuerte.
-    for tag in container.find_all(["a", "li", "p", "div", "span"], limit=60):
+    for tag in container.find_all(["a", "li", "p", "div", "span"], limit=80):
         if tag.name in ("h1", "h2", "h3", "hr"):
             break
-        # Si es anchor hacia Polymaker, prioriza
         if tag.name == "a":
-            href = (tag.get("href") or "").lower()
-            if "polymaker" in href:
-                consider_text(tag.get_text(" ", strip=True))
-                continue
-        # Si no, considera el texto igualmente (por si listan sin enlaces)
-        consider_text(tag.get_text(" ", strip=True))
+            href = (tag.get("href") or "").strip()
+            if POLY_DOMAIN_RE.search(href):
+                txt = tag.get_text(" ", strip=True)
+                for m in POLY_ITEM_RE.findall(txt):
+                    color = m.strip()
+                    key = color.lower()
+                    if key not in seen and len(color.split()) >= 2:
+                        seen.add(key)
+                        colors.append(color)
+    return colors
 
+
+def _extract_from_poly_block_relaxed(soup: BeautifulSoup):
+    """Fallback: mismo bloque, acepta texto 'Polymaker ... PLA' sin requerir enlaces."""
+    header_node = soup.find(string=HEADER_RE)
+    if not header_node:
+        return []
+
+    container = header_node.find_parent(["section", "div", "article", "main"]) or header_node.parent
+    colors, seen = [], set()
+
+    for tag in container.find_all(["li", "p", "div", "span"], limit=120):
+        if tag.name in ("h1", "h2", "h3", "hr"):
+            break
+        txt = tag.get_text(" ", strip=True)
+        for m in POLY_ITEM_RE.findall(txt):
+            color = m.strip()
+            key = color.lower()
+            if key not in seen and len(color.split()) >= 2:
+                seen.add(key)
+                colors.append(color)
     return colors
 
 def _normalize_color(c: str) -> str:
@@ -208,41 +225,36 @@ def _normalize_color(c: str) -> str:
     return x
 
 def extract_polymaker_colors(page, model_url: str):
-    """Abre la ficha y extrae título + colores (bloque Polymaker → fallback global)."""
+    """Abre la ficha y extrae título + colores (estricto → relajado → global)."""
     safe_goto(page, model_url, label="model")
     page.wait_for_timeout(1200)
 
     html = page.content()
     soup = BeautifulSoup(html, "lxml")
 
-    # Título
     title_node = soup.find(["h1", "title"])
     title_text = title_node.get_text(strip=True) if title_node else model_url.rsplit("/", 1)[-1]
-    # Limpieza de nombre (corta desde '(No Support...')
     title_text = re.sub(r"\s*\(No Support.*$", "", title_text).strip()
 
-    # 1) Bloque acotado
-    colors = _extract_from_poly_block(soup)
-
-    # 2) Fallback global si no hubo bloque
+    # 1) Bloque estricto → 2) relajado → 3) global
+    colors = _extract_from_poly_block_strict(soup)
+    if not colors:
+        colors = _extract_from_poly_block_relaxed(soup)
     if not colors:
         text = soup.get_text("\n", strip=True)
-        for m in POLY_LINE_RE.findall(text):
-            c = m.strip()
-            if c and c.lower() not in [x.lower() for x in colors]:
-                colors.append(c)
+        colors = [m.strip() for m in POLY_LINE_RE.findall(text)]
 
-    # Normaliza y dedup
-    clean = []
-    seen = set()
+    # Normalización mínima
+    clean, seen = [], set()
     for c in colors:
-        t = _normalize_color(c)
-        if not t:
+        x = re.sub(r"\bGrey\b", "Gray", c, flags=re.IGNORECASE)
+        x = re.sub(r"\s+", " ", x).strip(" -–—·.")
+        if len(x.split()) < 2:
             continue
-        key = t.lower()
+        key = x.lower()
         if key not in seen:
             seen.add(key)
-            clean.append(t)
+            clean.append(x)
 
     return title_text, clean
 
